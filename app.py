@@ -200,14 +200,78 @@ var inFile = new File('{_escape_jsx_path(str(staged_input_path))}');
 var outFile = new File('{_escape_jsx_path(str(out_file))}');
 var statusFile = new File('{_escape_jsx_path(str(status_file))}');
 
+function unlockLayerIfNeeded(doc) {{
+    try {{
+        if (doc.activeLayer && doc.activeLayer.isBackgroundLayer) {{
+            doc.activeLayer.isBackgroundLayer = false;
+        }}
+    }} catch (e) {{}}
+}}
+
+function runRemoveBackgroundMenu() {{
+    try {{
+        app.runMenuItem(stringIDToTypeID('autoCutout'));
+        return true;
+    }} catch (e1) {{
+        try {{
+            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
+            return true;
+        }} catch (e2) {{
+            return false;
+        }}
+    }}
+}}
+
+function selectSubjectAndMask() {{
+    // 1) Select Subject
+    var didSelect = false;
+    try {{
+        executeAction(stringIDToTypeID('selectSubject'), undefined, DialogModes.NO);
+        didSelect = true;
+    }} catch (s1) {{
+        try {{
+            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
+            didSelect = true;
+        }} catch (s2) {{
+            didSelect = false;
+        }}
+    }}
+    if (!didSelect) {{
+        throw new Error('No compatible Select Subject / Remove Background action found in this Photoshop version.');
+    }}
+
+    // 2) Create reveal-selection mask on current layer
+    var idMk = charIDToTypeID('Mk  ');
+    var desc = new ActionDescriptor();
+    var idNw = charIDToTypeID('Nw  ');
+    var idChnl = charIDToTypeID('Chnl');
+    desc.putClass(idNw, idChnl);
+
+    var idAt = charIDToTypeID('At  ');
+    var ref = new ActionReference();
+    ref.putEnumerated(charIDToTypeID('Chnl'), charIDToTypeID('Chnl'), charIDToTypeID('Msk '));
+    desc.putReference(idAt, ref);
+
+    var idUsng = charIDToTypeID('Usng');
+    var idUsrM = charIDToTypeID('UsrM');
+    var idRvlS = charIDToTypeID('RvlS');
+    desc.putEnumerated(idUsng, idUsrM, idRvlS);
+
+    executeAction(idMk, desc, DialogModes.NO);
+
+    try {{
+        doc.selection.deselect();
+    }} catch (e) {{}}
+}}
+
 try {{
     app.open(inFile);
     var doc = app.activeDocument;
+    unlockLayerIfNeeded(doc);
 
-    try {{
-        app.runMenuItem(stringIDToTypeID('autoCutout'));
-    }} catch (e) {{
-        app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
+    var removed = runRemoveBackgroundMenu();
+    if (!removed) {{
+        selectSubjectAndMask();
     }}
 
     var opts = new PNGSaveOptions();

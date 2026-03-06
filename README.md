@@ -50,6 +50,7 @@ In the UI, set **Background Removal Engine** to:
 - If Photoshop appears stuck on one image, check for hidden modal dialogs in Photoshop and disable startup/compatibility prompts.
 - Photoshop processing now stages per-image files under `output/.ps_jobs` to avoid temp-file lock/deletion races on Windows.
 - Photoshop automation now prefers Windows COM (`pywin32`) for stable per-image scripting, with CLI fallback if COM is unavailable.
+- Photoshop remove-background now uses a compatibility fallback chain (`autoCutout` → `autoCutoutSubject` → `Select Subject + layer mask`) for versions where certain menu items are unavailable.
 - Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
 - Added **Browse Input Folder** / **Browse Output Folder** buttons to open native folder picker dialogs (no copy/paste path needed).
 - If `photoshop` mode is selected without an exe path, the report returns a single clear configuration error instead of 1 failure per file.
