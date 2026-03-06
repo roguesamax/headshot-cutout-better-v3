@@ -362,10 +362,10 @@ def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[I
     raise RuntimeError("Invalid removal engine. Use photoshop, auto, or rembg.")
 
 
-def detect_primary_face_bbox(rgba_image: Image.Image) -> tuple[int, int, int, int] | None:
-    rgb = np.array(rgba_image.convert("RGB"))
+def detect_primary_face_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
+    rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    faces = CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(36, 36))
+    faces = CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
         return None
     x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
@@ -380,14 +380,38 @@ def alpha_bbox(rgba_image: Image.Image, threshold: int = 12) -> tuple[int, int, 
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
-def crop_headshot(rgba_image: Image.Image, config: ProcessConfig) -> tuple[Image.Image, list[str]]:
+def crop_headshot(
+    rgba_image: Image.Image,
+    config: ProcessConfig,
+    preferred_face: tuple[int, int, int, int] | None = None,
+) -> tuple[Image.Image, list[str]]:
     warnings: list[str] = []
     width, height = rgba_image.size
 
+    face = preferred_face or detect_primary_face_bbox(rgba_image)
     a_bbox = alpha_bbox(rgba_image)
-    face = detect_primary_face_bbox(rgba_image)
 
-    if a_bbox is None and face is None:
+    # Primary framing: face-first (for full-body sources this avoids body-centered crops).
+    if face is not None:
+        fx, fy, fw, fh = face
+        cx = fx + fw / 2.0
+        cy = fy + fh * 0.58  # keep slightly under-chin
+        side = max(fw * 2.45, fh * 2.65)
+
+        # keep crop somewhat aligned with extracted alpha when available
+        if a_bbox is not None:
+            ax1, ay1, ax2, ay2 = a_bbox
+            subj_w = ax2 - ax1 + 1
+            side = max(side, subj_w * 0.70)
+    elif a_bbox is not None:
+        warnings.append("Face detection failed; used alpha-mask fallback framing.")
+        ax1, ay1, ax2, ay2 = a_bbox
+        subj_w = ax2 - ax1 + 1
+        subj_h = ay2 - ay1 + 1
+        cx = (ax1 + ax2) / 2.0
+        cy = ay1 + subj_h * 0.36
+        side = max(subj_w * 1.05, subj_h * 0.72)
+    else:
         warnings.append("No subject/face reliably detected; used center square fallback.")
         side = min(width, height)
         left = (width - side) // 2
@@ -395,28 +419,7 @@ def crop_headshot(rgba_image: Image.Image, config: ProcessConfig) -> tuple[Image
         crop = rgba_image.crop((left, top, left + side, top + side))
         return crop.resize((config.output_size, config.output_size), Image.Resampling.LANCZOS), warnings
 
-    if a_bbox is not None:
-        ax1, ay1, ax2, ay2 = a_bbox
-        subj_w = ax2 - ax1 + 1
-        subj_h = ay2 - ay1 + 1
-        cx = (ax1 + ax2) / 2.0
-
-        if face is not None:
-            fx, fy, fw, fh = face
-            cy = fy + fh * 0.53
-            side = max(subj_w * 1.28, subj_h * 1.12)
-        else:
-            cy = ay1 + subj_h * 0.46
-            side = max(subj_w * 1.30, subj_h * 1.16)
-            warnings.append("Face detection failed; used alpha-mask framing.")
-    else:
-        fx, fy, fw, fh = face
-        cx = fx + fw / 2.0
-        cy = fy + fh * 0.53
-        side = max(fw * 2.0, fh * 1.9)
-        warnings.append("Alpha mask was weak; used face-based framing.")
-
-    side = int(max(32, min(side, max(width, height))))
+    side = int(max(40, min(side, max(width, height))))
     left = int(round(cx - side / 2))
     top = int(round(cy - side / 2))
     right = left + side
@@ -445,17 +448,17 @@ def crop_headshot(rgba_image: Image.Image, config: ProcessConfig) -> tuple[Image
     alpha = np.array(crop.split()[-1])
     visible_ratio = float(np.count_nonzero(alpha > 10)) / alpha.size
 
-    if visible_ratio < 0.14:
-        warnings.append("Visible subject area is too small; likely bad detect or tiny source subject.")
-    if visible_ratio > 0.88:
+    if visible_ratio < 0.10:
+        warnings.append("Visible subject area is too small; likely bad detection.")
+    if visible_ratio > 0.90:
         warnings.append("Visible subject area is very high; possible background remnants.")
 
     cols = np.count_nonzero(alpha > 12, axis=0)
     rows = np.count_nonzero(alpha > 12, axis=1)
-    if cols.size > 0 and (cols[0] > 12 or cols[-1] > 12):
+    if cols.size > 0 and (cols[0] > 10 or cols[-1] > 10):
         warnings.append("Subject touches side boundary; ear clipping risk.")
-    if rows.size > 0 and rows[0] > 12:
-        warnings.append("Subject touches top boundary; hair/forehead clipping risk.")
+    if rows.size > 0 and rows[0] > 10:
+        warnings.append("Subject touches top boundary; hair clipping risk.")
 
     return crop, warnings
 
@@ -468,8 +471,11 @@ def process_one(prepped: dict, output_root: Path, config: ProcessConfig) -> dict
     out_path = output_root / rel.with_suffix(".png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    staged_rgb = Image.open(staged_path).convert("RGB")
+    source_face = detect_primary_face_bbox(staged_rgb)
+
     rgba, bg_warnings = remove_background(staged_path, config)
-    headshot, crop_warnings = crop_headshot(rgba, config)
+    headshot, crop_warnings = crop_headshot(rgba, config, preferred_face=source_face)
     headshot.save(out_path, format="PNG", optimize=True)
 
     return {
@@ -509,7 +515,8 @@ def run_batch(
     max_side: int,
     removal_engine: str,
     photoshop_exe_input: str,
-) -> tuple[str, list[str], str, gr.update, str, np.ndarray, np.ndarray, np.ndarray, str]:
+    progress=gr.Progress(),
+) -> tuple[str, list[tuple[str, str]], str, gr.update, str, np.ndarray, np.ndarray, np.ndarray, str]:
     input_root = Path(input_folder)
     output_root = Path(output_folder)
 
@@ -568,7 +575,7 @@ def run_batch(
                 "processed": 0,
                 "failed": len(images),
                 "removal_engine": config.removal_engine,
-                "workers_used": 1 if config.removal_engine == "photoshop" else config.workers,
+                "workers_used": 1,
                 "preprocessed": 0,
                 "failures": [
                     "Photoshop executable not configured. Fill 'Photoshop Executable Path' in UI or set PHOTOSHOP_EXE."
@@ -590,12 +597,17 @@ def run_batch(
     results: list[dict] = []
     failures: list[str] = []
 
-    # Phase 1: preprocess/resize outside Photoshop in parallel for speed.
+    progress(0, desc="Starting batch…")
+
     prepped_items: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as prep_executor:
         prep_futures = {prep_executor.submit(preprocess_image_to_stage, img, input_root, config): img for img in images}
+        prep_done = 0
+        prep_total = max(1, len(prep_futures))
         for future in as_completed(prep_futures):
             image = prep_futures[future]
+            prep_done += 1
+            progress(prep_done / (prep_total * 2), desc=f"Preprocessing {prep_done}/{prep_total}")
             try:
                 prepped_items.append(future.result())
             except Exception as exc:
@@ -603,12 +615,15 @@ def run_batch(
 
     prepped_items.sort(key=lambda r: r["relative"])
 
-    # Phase 2: background removal (Photoshop/rembg) + crop/export.
     processing_workers = 1 if config.removal_engine == "photoshop" else config.workers
     with ThreadPoolExecutor(max_workers=processing_workers) as executor:
         futures = {executor.submit(process_one, item, output_root, config): item for item in prepped_items}
+        proc_done = 0
+        proc_total = max(1, len(futures))
         for future in as_completed(futures):
             item = futures[future]
+            proc_done += 1
+            progress(0.5 + (proc_done / proc_total) * 0.5, desc=f"Photoshop/Crop {proc_done}/{proc_total}")
             try:
                 results.append(future.result())
             except Exception as exc:
@@ -627,9 +642,14 @@ def run_batch(
         "photoshop_automation_mode": config.photoshop_automation_mode,
         "failures": failures,
         "issues": [asdict(HeadshotIssue(r["relative"], r["warnings"])) for r in results if r["warnings"]],
+        "log": [
+            f"Preprocessed {len(prepped_items)} files outside Photoshop.",
+            f"Processed {len(results)} files through removal/crop stage.",
+        ],
     }
 
     preview_paths = [r["output"] for r in results]
+    gallery_items = [(p, Path(p).name) for p in preview_paths]
     report_text = json.dumps(report, indent=2)
 
     if not preview_paths:
@@ -650,7 +670,7 @@ def run_batch(
     w, g, b = show_preview(first)
     return (
         report_text,
-        preview_paths,
+        gallery_items,
         json.dumps(results),
         gr.update(choices=preview_paths, value=first),
         first,
