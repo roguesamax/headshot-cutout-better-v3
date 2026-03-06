@@ -1,17 +1,19 @@
 # Pro Headshot Cutout Studio
 
-A production-oriented batch headshot tool with a dark-mode UI that:
+Photoshop-first batch tool for creating consistent `250x250` transparent PNG headshots with a dark-mode UI.
 
-- Ingests large source folders recursively.
-- Optimizes oversized files before heavy processing for speed.
-- Removes backgrounds (Photoshop hook when configured, local AI fallback via `rembg`).
-- Crops to a 250x250 transparent PNG headshot focused on head + slight under-chin.
+## What it does
+
+- Scans source folders recursively.
 - Preserves input folder structure in output.
-- Flags potential quality issues.
-- Shows large final previews on white/grey/black.
-- Lets users open both source + output in Photoshop for manual fixes.
+- Optimizes huge source images before processing for speed.
+- Removes background with **Photoshop Remove Background** (recommended baseline), with optional fallback modes.
+- Frames/crops headshot to keep head centered with slight under-chin visibility.
+- Shows large previews on white / grey / black backgrounds.
+- Lets user open both source + output in Photoshop for manual touchups.
+- Emits issue warnings (possible clipping, weak detections, odd coverage).
 
-## Quick start
+## Install
 
 ```bash
 python -m venv .venv
@@ -22,20 +24,27 @@ python app.py
 
 Open: `http://localhost:7860`
 
-## Photoshop integration
+## Photoshop setup (Windows)
 
-Set environment vars to enable direct launch/edit:
+Set `PHOTOSHOP_EXE` to Photoshop executable path.
 
-- `PHOTOSHOP_EXE` → full path to Photoshop executable.
-- `PHOTOSHOP_BG_JSX` → optional JSX script path for custom automation.
+Example PowerShell:
 
-If not configured, the app uses local AI background removal (`rembg`) automatically.
+```powershell
+$env:PHOTOSHOP_EXE = "C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe"
+python app.py
+```
 
-## Output behavior
+In the UI, set **Background Removal Engine** to:
 
-- Final format: transparent PNG.
-- Final size: `250x250`.
-- Folder structure is preserved from input root to output root.
+- `photoshop` → strict Photoshop Remove Background only (best quality baseline).
+- `auto` → Photoshop first, then rembg fallback if Photoshop fails.
+- `rembg` → local AI only (no Photoshop).
+
+## Notes
+
+- For `photoshop` mode, worker count is forced to 1 because Photoshop automation is single-instance and parallel jobs can conflict.
+- If preview panes are blank, pick an output from **Pick Output (stable preview)** dropdown (in addition to gallery click).
 
 ## Supported input file types
 
