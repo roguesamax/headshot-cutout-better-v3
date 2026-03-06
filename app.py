@@ -448,6 +448,86 @@ def alpha_bbox(rgba_image: Image.Image, threshold: int = 12) -> tuple[int, int, 
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
+def _prepare_final_rgba_image(image: Image.Image, output_size: int) -> Image.Image:
+    """Match legacy framing behavior: fit crop to output height and center horizontally."""
+    src = image.convert("RGBA")
+    h, w = src.height, src.width
+    if h <= 0 or w <= 0:
+        return Image.new("RGBA", (output_size, output_size), (0, 0, 0, 0))
+
+    ratio = min(float(w / h), float(h / w))
+    new_w = max(1, min(output_size, int(round(output_size * ratio))))
+    resized = src.resize((new_w, output_size), Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (output_size, output_size), (0, 0, 0, 0))
+    x_offset = max(0, (output_size - new_w) // 2)
+    canvas.alpha_composite(resized, (x_offset, 0))
+    return canvas
+
+
+def _legacy_landmark_bounds(
+    rgba_image: Image.Image,
+    face: tuple[int, int, int, int],
+    landmarks: np.ndarray | None,
+) -> tuple[int, int, int, int] | None:
+    """Replicate the older landmark+contour framing that previously worked well."""
+    if landmarks is None or landmarks.shape[0] < 68:
+        return None
+
+    rgb = np.array(rgba_image.convert("RGBA"))
+    alpha = rgb[:, :, 3]
+    rgb[alpha == 0] = [255, 255, 255, 255]
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    if gray.dtype == np.uint16:
+        gray = cv2.convertScaleAbs(gray, alpha=(255.0 / 65535.0))
+
+    fx, fy, fw, fh = face
+    if fw <= 0 or fh <= 0:
+        return None
+
+    jaw_y = int(np.max(landmarks[:, 1]))
+    y_limit = int(min(gray.shape[0], max(1, fy + fh * 1.15)))
+    if y_limit <= 1:
+        return None
+
+    face_area = gray[0:y_limit, :]
+    _, binary = cv2.threshold(face_area, 220, 255, cv2.THRESH_BINARY_INV)
+
+    cut_bottom = int(max(1, min(binary.shape[0], fy + fh * 0.8)))
+    cut = binary[0:cut_bottom, :]
+    contours, _ = cv2.findContours(cut, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if contour.size == 0:
+        return None
+
+    ext_left = int(contour[:, :, 0].min())
+    ext_right = int(contour[:, :, 0].max())
+    ext_top = int(contour[:, :, 1].min())
+
+    # Slightly safer than the legacy 1.045 to avoid over-shirt while still preserving chin margin.
+    bottom = int(round(jaw_y * 1.04))
+
+    # Give a little extra room over the contour top so hair doesn't clip.
+    top = int(round(ext_top - fh * 0.03))
+    left = int(round(ext_left - fw * 0.02))
+    right = int(round(ext_right + fw * 0.02))
+
+    h, w = gray.shape[:2]
+    left = max(0, left)
+    right = min(w, right)
+    top = max(0, top)
+    bottom = min(h, bottom)
+
+    if right - left < 12 or bottom - top < 12:
+        return None
+
+    return left, top, right, bottom
+
+
 def crop_headshot(
     rgba_image: Image.Image,
     config: ProcessConfig,
@@ -490,6 +570,19 @@ def crop_headshot(
         return left, top, right, bottom, side
 
     if face is not None:
+        legacy_bounds = _legacy_landmark_bounds(rgba_image, face, landmarks)
+        if legacy_bounds is not None:
+            left, top, right, bottom = legacy_bounds
+            crop = rgba_image.crop((left, top, right, bottom))
+            final = _prepare_final_rgba_image(crop, config.output_size)
+
+            alpha = np.array(final.split()[-1])
+            rows = np.count_nonzero(alpha > 12, axis=1)
+            if rows.size > 0 and rows[0] > 10:
+                warnings.append("Subject touches top boundary; hair clipping risk.")
+
+            return final, warnings
+
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
 
