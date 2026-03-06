@@ -422,8 +422,8 @@ def crop_headshot(
     if face is not None:
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
-        cy = fy + fh * 0.49  # tighter chin framing
-        side = max(fw * 1.62, fh * 1.78)
+        cy = fy + fh * 0.44  # add more hair headroom
+        side = max(fw * 1.74, fh * 1.92)
     elif a_bbox is not None:
         warnings.append("Face detection failed; used alpha-mask fallback framing.")
         ax1, ay1, ax2, ay2 = a_bbox
@@ -837,6 +837,7 @@ def build_ui() -> gr.Blocks:
         )
 
         gallery.select(fn=extract_gallery_path, outputs=selected)
+        gallery.select(fn=lambda evt: extract_gallery_path(evt), outputs=picker)
         picker.change(fn=lambda v: v or "", inputs=picker, outputs=selected)
         selected.change(fn=show_preview, inputs=selected, outputs=[preview_white, preview_grey, preview_black])
         selected.change(fn=find_paths_from_results, inputs=[selected, state_results], outputs=[source_for_open, actual_output_for_open])

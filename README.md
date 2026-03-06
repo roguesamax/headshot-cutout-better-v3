@@ -8,7 +8,7 @@ Photoshop-first batch tool for creating consistent `250x250` transparent PNG hea
 - Preserves input folder structure in output.
 - Optimizes huge source images before processing for speed (outside Photoshop, in parallel).
 - Removes background with **Photoshop Remove Background** (recommended baseline), with optional fallback modes.
-- Frames/crops headshot using face-first framing to keep head centered at 250x250 with slight under-chin visibility.
+- Frames/crops headshot using face-first framing with extra top hair headroom to reduce clipping while keeping 250x250 composition.
 - Uses dlib HOG face detection when available (falls back to OpenCV Haar) for better centering robustness.
 - Shows large previews on white / grey / black backgrounds.
 - Lets user open both source + output in Photoshop for manual touchups.
@@ -53,6 +53,7 @@ In the UI, set **Background Removal Engine** to:
 - Photoshop automation now runs COM-only by default (`pywin32`) for stability; this avoids Photoshop CLI SPL memory-manager failures seen on recent builds (including 2026).
 - Photoshop remove-background now uses an expanded compatibility fallback chain (`removeBackground`/`autoCutout` IDs → `Select Subject` IDs → `selection mask`) for versions where certain menu items are unavailable.
 - Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
+- Clicking a gallery item now also sets the preview picker so white/grey/black previews update immediately from top-right selection.
 - Batch report now includes simple processing logs and progress is shown while preprocessing + Photoshop/crop stages run.
 - UI preview/gallery files are mirrored into a local `.ui_cache` under the app directory to avoid Gradio external-path cache errors.
 - UI selection now maps cached preview paths back to the real output path (`Matched Output`) so Photoshop opens the actual exported file.
