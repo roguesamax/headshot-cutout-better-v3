@@ -13,7 +13,7 @@ from tkinter import filedialog
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import cv2
 import gradio as gr
@@ -54,6 +54,35 @@ def _resolve_dlib_module():
 
 DLIB = _resolve_dlib_module()
 DLIB_HOG_DETECTOR = DLIB.get_frontal_face_detector() if DLIB is not None else None
+
+
+def _resolve_landmark_predictor() -> Optional[object]:
+    if DLIB is None:
+        return None
+
+    candidates = [
+        Path.cwd() / "shape_predictor_68_face_landmarks.dat",
+        Path.cwd() / "data" / "shape_predictor_68_face_landmarks.dat",
+        Path(__file__).resolve().parent / "shape_predictor_68_face_landmarks.dat",
+        Path(__file__).resolve().parent / "data" / "shape_predictor_68_face_landmarks.dat",
+    ]
+    for c in candidates:
+        if c.exists():
+            try:
+                return DLIB.shape_predictor(str(c))
+            except Exception:
+                pass
+    return None
+
+
+def _shape_to_np(shape, dtype="int") -> np.ndarray:
+    coords = np.zeros((68, 2), dtype=dtype)
+    for i in range(68):
+        coords[i] = (shape.part(i).x, shape.part(i).y)
+    return coords
+
+
+DLIB_LANDMARK_PREDICTOR = _resolve_landmark_predictor()
 
 
 @dataclass
@@ -373,11 +402,11 @@ def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[I
     raise RuntimeError("Invalid removal engine. Use photoshop, auto, or rembg.")
 
 
-def detect_primary_face_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
+def detect_face_details(image: Image.Image) -> tuple[tuple[int, int, int, int] | None, np.ndarray | None]:
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    # 1) dlib HOG (if available) is generally more stable for portrait framing.
+    # 1) dlib HOG + landmarks when available.
     if DLIB_HOG_DETECTOR is not None:
         try:
             rects = DLIB_HOG_DETECTOR(gray, 1)
@@ -387,16 +416,28 @@ def detect_primary_face_bbox(image: Image.Image) -> tuple[int, int, int, int] | 
                 y = max(0, int(rect.top()))
                 w = max(1, int(rect.right() - rect.left()))
                 h = max(1, int(rect.bottom() - rect.top()))
-                return x, y, w, h
+                landmarks = None
+                if DLIB_LANDMARK_PREDICTOR is not None:
+                    try:
+                        shape = DLIB_LANDMARK_PREDICTOR(gray, rect)
+                        landmarks = _shape_to_np(shape)
+                    except Exception:
+                        landmarks = None
+                return (x, y, w, h), landmarks
         except Exception:
             pass
 
     # 2) OpenCV Haar fallback.
     faces = CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
-        return None
+        return None, None
     x, y, w, h = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
-    return int(x), int(y), int(w), int(h)
+    return (int(x), int(y), int(w), int(h)), None
+
+
+def detect_primary_face_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
+    face, _ = detect_face_details(image)
+    return face
 
 
 def alpha_bbox(rgba_image: Image.Image, threshold: int = 12) -> tuple[int, int, int, int] | None:
@@ -411,6 +452,7 @@ def crop_headshot(
     rgba_image: Image.Image,
     config: ProcessConfig,
     preferred_face: tuple[int, int, int, int] | None = None,
+    landmarks: np.ndarray | None = None,
 ) -> tuple[Image.Image, list[str]]:
     warnings: list[str] = []
     width, height = rgba_image.size
@@ -459,6 +501,13 @@ def crop_headshot(
         hair_top_est = fy - fh * 0.32
         left_face_est = fx - fw * 0.08
         right_face_est = fx + fw * 1.08
+
+        if landmarks is not None and landmarks.shape[0] >= 68:
+            jaw_y = float(landmarks[8][1])
+            brow_top = float(np.min(landmarks[17:27, 1]))
+            hair_top_est = brow_top - (jaw_y - brow_top) * 0.52
+            left_face_est = float(np.min(landmarks[:, 0])) - fw * 0.03
+            right_face_est = float(np.max(landmarks[:, 0])) + fw * 0.03
 
         chosen = None
         for _ in range(12):
@@ -528,10 +577,10 @@ def process_one(prepped: dict, output_root: Path, config: ProcessConfig) -> dict
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     staged_rgb = Image.open(staged_path).convert("RGB")
-    source_face = detect_primary_face_bbox(staged_rgb)
+    source_face, source_landmarks = detect_face_details(staged_rgb)
 
     rgba, bg_warnings = remove_background(staged_path, config)
-    headshot, crop_warnings = crop_headshot(rgba, config, preferred_face=source_face)
+    headshot, crop_warnings = crop_headshot(rgba, config, preferred_face=source_face, landmarks=source_landmarks)
     headshot.save(out_path, format="PNG", optimize=True)
 
     return {

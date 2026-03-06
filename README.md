@@ -25,6 +25,11 @@ python app.py
 
 Open: `http://localhost:7860`
 
+## Landmark model (optional but recommended)
+
+If available, place `shape_predictor_68_face_landmarks.dat` in the repo root or `data/` folder.
+This improves face framing accuracy (hair/chin balance) and generally matches your previous marker-based behavior more closely.
+
 ## Photoshop setup (Windows)
 
 You can configure Photoshop in either way:
