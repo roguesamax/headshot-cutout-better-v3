@@ -53,6 +53,7 @@ class ProcessConfig:
     removal_engine: str = "photoshop"
     photoshop_exe: str = ""
     job_root: str = ""
+    prep_root: str = ""
 
 
 @dataclass
@@ -78,6 +79,18 @@ def optimize_input_image(src_path: Path, config: ProcessConfig) -> Image.Image:
         scale = config.max_side_for_processing / max_side
         image = image.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
     return image
+
+
+def preprocess_image_to_stage(src_path: Path, input_root: Path, config: ProcessConfig) -> dict:
+    rel = src_path.relative_to(input_root)
+    prep_root = Path(config.prep_root)
+    staged_path = prep_root / rel.with_suffix(".jpg")
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+
+    optimized = optimize_input_image(src_path, config)
+    optimized.save(staged_path, format="JPEG", quality=90, optimize=True, progressive=True)
+
+    return {"source": str(src_path), "relative": str(rel), "staged": str(staged_path)}
 
 
 def _escape_jsx_path(path: str) -> str:
@@ -166,7 +179,7 @@ def _remove_background_photoshop_cli(job_dir: Path, photoshop_exe: str, jsx_file
     raise RuntimeError("Timed out waiting for Photoshop output in CLI mode.")
 
 
-def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job_root: Path) -> Image.Image:
+def _remove_background_photoshop(staged_input_path: Path, photoshop_exe: str, job_root: Path) -> Image.Image:
     if not photoshop_exe and WIN32COM_CLIENT is None:
         raise RuntimeError(
             "Photoshop is not configured. Set executable path and/or install pywin32 for COM automation."
@@ -176,17 +189,14 @@ def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job
     job_dir = job_root / f"job_{job_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    src_file = job_dir / f"source_{job_id}.png"
     out_file = job_dir / f"result_{job_id}.png"
     status_file = job_dir / f"status_{job_id}.txt"
     jsx_file = job_dir / f"remove_bg_{job_id}.jsx"
 
-    rgb_image.save(src_file, format="PNG")
-
     jsx = f"""
 #target photoshop
 app.displayDialogs = DialogModes.NO;
-var inFile = new File('{_escape_jsx_path(str(src_file))}');
+var inFile = new File('{_escape_jsx_path(str(staged_input_path))}');
 var outFile = new File('{_escape_jsx_path(str(out_file))}');
 var statusFile = new File('{_escape_jsx_path(str(status_file))}');
 
@@ -239,33 +249,34 @@ try {{
     return Image.open(out_file).convert("RGBA")
 
 
-def _remove_background_rembg(rgb_image: Image.Image) -> Image.Image:
+def _remove_background_rembg(staged_input_path: Path) -> Image.Image:
     if REMBG_REMOVE is None:
         raise RuntimeError("rembg is not available. Install rembg + onnxruntime.")
+    rgb_image = Image.open(staged_input_path).convert("RGB")
     raw = np.array(rgb_image)
     out = REMBG_REMOVE(raw)
     return Image.fromarray(out).convert("RGBA")
 
 
-def remove_background(rgb_image: Image.Image, config: ProcessConfig) -> tuple[Image.Image, list[str]]:
+def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[Image.Image, list[str]]:
     warnings: list[str] = []
     engine = (config.removal_engine or "photoshop").lower().strip()
 
     if engine == "photoshop":
-        rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe, Path(config.job_root))
+        rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root))
         return rgba, warnings
 
     if engine == "rembg":
-        rgba = _remove_background_rembg(rgb_image)
+        rgba = _remove_background_rembg(staged_input_path)
         return rgba, warnings
 
     if engine == "auto":
         try:
-            rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe, Path(config.job_root))
+            rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root))
             warnings.append("Used Photoshop background removal.")
             return rgba, warnings
         except Exception:
-            rgba = _remove_background_rembg(rgb_image)
+            rgba = _remove_background_rembg(staged_input_path)
             warnings.append("Photoshop unavailable, used rembg fallback.")
             return rgba, warnings
 
@@ -370,13 +381,15 @@ def crop_headshot(rgba_image: Image.Image, config: ProcessConfig) -> tuple[Image
     return crop, warnings
 
 
-def process_one(src_path: Path, input_root: Path, output_root: Path, config: ProcessConfig) -> dict:
-    rel = src_path.relative_to(input_root)
+def process_one(prepped: dict, output_root: Path, config: ProcessConfig) -> dict:
+    rel = Path(prepped["relative"])
+    src_path = Path(prepped["source"])
+    staged_path = Path(prepped["staged"])
+
     out_path = output_root / rel.with_suffix(".png")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    optimized = optimize_input_image(src_path, config)
-    rgba, bg_warnings = remove_background(optimized, config)
+    rgba, bg_warnings = remove_background(staged_path, config)
     headshot, crop_warnings = crop_headshot(rgba, config)
     headshot.save(out_path, format="PNG", optimize=True)
 
@@ -454,7 +467,9 @@ def run_batch(
 
     photoshop_exe = (photoshop_exe_input or "").strip() or discover_photoshop_exe()
     job_root = output_root / ".ps_jobs"
+    prep_root = output_root / ".prep"
     job_root.mkdir(parents=True, exist_ok=True)
+    prep_root.mkdir(parents=True, exist_ok=True)
 
     config = ProcessConfig(
         workers=max(1, int(workers)),
@@ -462,6 +477,7 @@ def run_batch(
         removal_engine=(removal_engine or "photoshop").lower(),
         photoshop_exe=photoshop_exe,
         job_root=str(job_root),
+        prep_root=str(prep_root),
     )
 
     if config.removal_engine == "photoshop":
@@ -472,7 +488,8 @@ def run_batch(
                 "processed": 0,
                 "failed": len(images),
                 "removal_engine": config.removal_engine,
-                "workers_used": config.workers,
+                "workers_used": 1 if config.removal_engine == "photoshop" else config.workers,
+                "preprocessed": 0,
                 "failures": [
                     "Photoshop executable not configured. Fill 'Photoshop Executable Path' in UI or set PHOTOSHOP_EXE."
                 ],
@@ -493,14 +510,29 @@ def run_batch(
     results: list[dict] = []
     failures: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=config.workers) as executor:
-        futures = {executor.submit(process_one, img, input_root, output_root, config): img for img in images}
+    # Phase 1: preprocess/resize outside Photoshop in parallel for speed.
+    prepped_items: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as prep_executor:
+        prep_futures = {prep_executor.submit(preprocess_image_to_stage, img, input_root, config): img for img in images}
+        for future in as_completed(prep_futures):
+            image = prep_futures[future]
+            try:
+                prepped_items.append(future.result())
+            except Exception as exc:
+                failures.append(f"{image}: preprocess failed: {exc}")
+
+    prepped_items.sort(key=lambda r: r["relative"])
+
+    # Phase 2: background removal (Photoshop/rembg) + crop/export.
+    processing_workers = 1 if config.removal_engine == "photoshop" else config.workers
+    with ThreadPoolExecutor(max_workers=processing_workers) as executor:
+        futures = {executor.submit(process_one, item, output_root, config): item for item in prepped_items}
         for future in as_completed(futures):
-            image = futures[future]
+            item = futures[future]
             try:
                 results.append(future.result())
             except Exception as exc:
-                failures.append(f"{image}: {exc}")
+                failures.append(f"{item['source']}: {exc}")
 
     results.sort(key=lambda r: r["relative"])
 
@@ -509,7 +541,8 @@ def run_batch(
         "processed": len(results),
         "failed": len(failures),
         "removal_engine": config.removal_engine,
-        "workers_used": config.workers,
+        "workers_used": 1 if config.removal_engine == "photoshop" else config.workers,
+        "preprocessed": len(prepped_items),
         "photoshop_exe": config.photoshop_exe or "",
         "failures": failures,
         "issues": [asdict(HeadshotIssue(r["relative"], r["warnings"])) for r in results if r["warnings"]],
@@ -627,8 +660,8 @@ def build_ui() -> gr.Blocks:
                     label="Background Removal Engine",
                     info="photoshop = strict Photoshop Remove Background, auto = Photoshop then rembg fallback",
                 )
-                workers = gr.Slider(1, max(2, os.cpu_count() or 8), value=max(1, (os.cpu_count() or 4) - 1), step=1, label="Parallel Workers")
-                max_side = gr.Slider(800, 4500, value=2200, step=100, label="Pre-resize Max Side (speed control)")
+                workers = gr.Slider(1, max(2, os.cpu_count() or 8), value=max(1, (os.cpu_count() or 4) - 1), step=1, label="Parallel Preprocess Workers")
+                max_side = gr.Slider(800, 4500, value=1800, step=100, label="Pre-resize Max Side (outside Photoshop)")
                 run_btn = gr.Button("Process Batch", variant="primary")
                 report = gr.Code(label="Batch Report / Issue Detection", language="json")
 

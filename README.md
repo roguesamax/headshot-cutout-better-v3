@@ -6,7 +6,7 @@ Photoshop-first batch tool for creating consistent `250x250` transparent PNG hea
 
 - Scans source folders recursively.
 - Preserves input folder structure in output.
-- Optimizes huge source images before processing for speed.
+- Optimizes huge source images before processing for speed (outside Photoshop, in parallel).
 - Removes background with **Photoshop Remove Background** (recommended baseline), with optional fallback modes.
 - Frames/crops headshot to keep head centered with slight under-chin visibility.
 - Shows large previews on white / grey / black backgrounds.
@@ -46,7 +46,7 @@ In the UI, set **Background Removal Engine** to:
 
 ## Notes
 
-- For `photoshop` mode, worker count is forced to 1 because Photoshop automation is single-instance and parallel jobs can conflict.
+- For `photoshop` mode, only the Photoshop/background-removal step runs single-threaded; preprocessing (resize/optimize) runs in parallel outside Photoshop.
 - If Photoshop appears stuck on one image, check for hidden modal dialogs in Photoshop and disable startup/compatibility prompts.
 - Photoshop processing now stages per-image files under `output/.ps_jobs` to avoid temp-file lock/deletion races on Windows.
 - Photoshop automation now prefers Windows COM (`pywin32`) for stable per-image scripting, with CLI fallback if COM is unavailable.
