@@ -451,37 +451,32 @@ def crop_headshot(
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
 
-        # Target composition: chin ~3-5 px above bottom in 250x250 output.
+        # Tighter portrait composition: mostly head, tiny under-chin (~3-5 px at output scale).
         target_chin_px = config.output_size - 4
-        side = max(fw * 1.58, fh * 1.72)
+        side = max(fw * 1.34, fh * 1.46)
 
         jaw_y = fy + fh
-        hair_top_est = fy - fh * 0.34
-        left_ear_est = fx - fw * 0.22
-        right_ear_est = fx + fw * 1.22
+        hair_top_est = fy - fh * 0.32
+        left_face_est = fx - fw * 0.08
+        right_face_est = fx + fw * 1.08
 
         chosen = None
-        for _ in range(14):
+        for _ in range(12):
             cy = jaw_y - ((target_chin_px / config.output_size) - 0.5) * side
-            left, top, right, bottom, side_used = clamp_square(cx, cy, side)
+            left, top, right, bottom, _ = clamp_square(cx, cy, side)
 
-            # Hard constraints to avoid clipping.
+            # Only enforce head/face clipping constraints (not full alpha body bounds).
             ok_hair = top <= hair_top_est + 1
-            ok_side_face = left <= left_ear_est + 1 and right >= right_ear_est - 1
+            ok_side_face = left <= left_face_est + 1 and right >= right_face_est - 1
 
-            ok_alpha = True
-            if a_bbox is not None:
-                ax1, ay1, ax2, ay2 = a_bbox
-                ok_alpha = top <= ay1 + 1 and left <= ax1 + 1 and right >= ax2 - 1
-
-            if ok_hair and ok_side_face and ok_alpha:
+            if ok_hair and ok_side_face:
                 chosen = (left, top, right, bottom)
                 break
 
-            side *= 1.08
+            side *= 1.06
 
         if chosen is None:
-            warnings.append("Adaptive framing hit bounds; used safest unclipped crop.")
+            warnings.append("Adaptive framing hit bounds; used tightest safe crop.")
             cy = jaw_y - ((target_chin_px / config.output_size) - 0.5) * side
             chosen = clamp_square(cx, cy, side)[:4]
 
