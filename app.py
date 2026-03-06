@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import time
+import uuid
 import tkinter as tk
 from tkinter import filedialog
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,6 +41,7 @@ class ProcessConfig:
     workers: int = max(1, (os.cpu_count() or 4) - 1)
     removal_engine: str = "photoshop"
     photoshop_exe: str = ""
+    job_root: str = ""
 
 
 @dataclass
@@ -108,21 +110,22 @@ def discover_photoshop_exe() -> str:
     return ""
 
 
-def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str) -> Image.Image:
+def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job_root: Path) -> Image.Image:
     if not photoshop_exe:
         raise RuntimeError(
             "Photoshop executable is not configured. Set PHOTOSHOP_EXE or use the UI field."
         )
 
-    with tempfile.TemporaryDirectory() as td:
-        tmp_dir = Path(td)
-        src_file = tmp_dir / "source.png"
-        out_file = tmp_dir / "result.png"
-        jsx_file = tmp_dir / "remove_bg.jsx"
+    job_dir = job_root / f"job_{uuid.uuid4().hex}"
+    job_dir.mkdir(parents=True, exist_ok=True)
 
-        rgb_image.save(src_file, format="PNG")
+    src_file = job_dir / "source.png"
+    out_file = job_dir / "result.png"
+    jsx_file = job_dir / "remove_bg.jsx"
 
-        jsx = f"""
+    rgb_image.save(src_file, format="PNG")
+
+    jsx = f"""
 #target photoshop
 app.displayDialogs = DialogModes.NO;
 var inFile = new File('{_escape_jsx_path(str(src_file))}');
@@ -145,30 +148,33 @@ opts.compression = 6;
 doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
 doc.close(SaveOptions.DONOTSAVECHANGES);
 """
-        jsx_file.write_text(jsx, encoding="utf-8")
+    jsx_file.write_text(jsx, encoding="utf-8")
 
-        proc = subprocess.Popen(
-            [photoshop_exe, "-r", str(jsx_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    proc = subprocess.Popen(
+        [photoshop_exe, "-r", str(jsx_file)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
 
-        deadline = time.time() + 90
-        while time.time() < deadline:
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if out_file.exists():
+            # Copy into memory immediately; keep source files on disk to avoid lock/delete races.
+            return Image.open(out_file).convert("RGBA")
+
+        # Some Photoshop builds can return non-zero while still doing work; do not fail fast.
+        if proc.poll() is not None and proc.returncode == 0 and not out_file.exists():
+            # Small grace period after process exits.
+            time.sleep(0.6)
             if out_file.exists():
                 return Image.open(out_file).convert("RGBA")
 
-            if proc.poll() is not None and proc.returncode not in (0, None):
-                stdout, stderr = proc.communicate()
-                raise RuntimeError(f"Photoshop failed: {(stderr or stdout).strip()}")
+        time.sleep(0.25)
 
-            time.sleep(0.25)
-
-        raise RuntimeError(
-            "Timed out waiting for Photoshop output. Photoshop may be waiting on a modal dialog. "
-            "Disable startup dialogs in Photoshop preferences and retry."
-        )
+    raise RuntimeError(
+        "Timed out waiting for Photoshop output. Photoshop may be blocked by modal dialogs or plugin prompts."
+    )
 
 
 def _remove_background_rembg(rgb_image: Image.Image) -> Image.Image:
@@ -184,7 +190,7 @@ def remove_background(rgb_image: Image.Image, config: ProcessConfig) -> tuple[Im
     engine = (config.removal_engine or "photoshop").lower().strip()
 
     if engine == "photoshop":
-        rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe)
+        rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe, Path(config.job_root))
         return rgba, warnings
 
     if engine == "rembg":
@@ -193,7 +199,7 @@ def remove_background(rgb_image: Image.Image, config: ProcessConfig) -> tuple[Im
 
     if engine == "auto":
         try:
-            rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe)
+            rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe, Path(config.job_root))
             warnings.append("Used Photoshop background removal.")
             return rgba, warnings
         except Exception:
@@ -385,11 +391,15 @@ def run_batch(
     output_root.mkdir(parents=True, exist_ok=True)
 
     photoshop_exe = (photoshop_exe_input or "").strip() or discover_photoshop_exe()
+    job_root = output_root / ".ps_jobs"
+    job_root.mkdir(parents=True, exist_ok=True)
+
     config = ProcessConfig(
         workers=max(1, int(workers)),
         max_side_for_processing=int(max_side),
         removal_engine=(removal_engine or "photoshop").lower(),
         photoshop_exe=photoshop_exe,
+        job_root=str(job_root),
     )
 
     if config.removal_engine == "photoshop":
