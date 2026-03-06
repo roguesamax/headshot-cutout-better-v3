@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import json
 import os
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -14,13 +17,18 @@ import gradio as gr
 import numpy as np
 from PIL import Image
 
-try:
-    from rembg import remove as rembg_remove
-except Exception:
-    rembg_remove = None
-
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".heic"}
+
+
+def _resolve_rembg_remove():
+    if importlib.util.find_spec("rembg") is None:
+        return None
+    rembg_module = importlib.import_module("rembg")
+    return getattr(rembg_module, "remove", None)
+
+
+REMBG_REMOVE = _resolve_rembg_remove()
 
 
 @dataclass
@@ -29,6 +37,7 @@ class ProcessConfig:
     output_size: int = 250
     workers: int = max(1, (os.cpu_count() or 4) - 1)
     removal_engine: str = "photoshop"
+    photoshop_exe: str = ""
 
 
 @dataclass
@@ -60,10 +69,34 @@ def _escape_jsx_path(path: str) -> str:
     return path.replace("\\", "\\\\")
 
 
-def _remove_background_photoshop(rgb_image: Image.Image) -> Image.Image:
-    photoshop_exe = os.environ.get("PHOTOSHOP_EXE")
+def discover_photoshop_exe() -> str:
+    env_val = os.environ.get("PHOTOSHOP_EXE", "").strip()
+    if env_val and Path(env_val).exists():
+        return env_val
+
+    if os.name != "nt":
+        return ""
+
+    candidates = [
+        r"C:\Program Files\Adobe\Adobe Photoshop 2025\Photoshop.exe",
+        r"C:\Program Files\Adobe\Adobe Photoshop 2024\Photoshop.exe",
+        r"C:\Program Files\Adobe\Adobe Photoshop 2023\Photoshop.exe",
+        r"C:\Program Files\Adobe\Adobe Photoshop 2022\Photoshop.exe",
+        r"C:\Program Files\Adobe\Adobe Photoshop 2021\Photoshop.exe",
+        r"C:\Program Files\Adobe\Adobe Photoshop 2020\Photoshop.exe",
+    ]
+    for path in candidates:
+        if Path(path).exists():
+            return path
+
+    return ""
+
+
+def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str) -> Image.Image:
     if not photoshop_exe:
-        raise RuntimeError("PHOTOSHOP_EXE is not set.")
+        raise RuntimeError(
+            "Photoshop executable is not configured. Set PHOTOSHOP_EXE or use the UI field."
+        )
 
     with tempfile.TemporaryDirectory() as td:
         tmp_dir = Path(td)
@@ -82,10 +115,10 @@ app.open(inFile);
 var doc = app.activeDocument;
 
 try {{
-    app.runMenuItem(stringIDToTypeID('autoCutout')); // Remove Background
+    app.runMenuItem(stringIDToTypeID('autoCutout'));
 }} catch (e) {{
     try {{
-        app.runMenuItem(stringIDToTypeID('autoCutoutSubject')); // fallback for older ids
+        app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
     }} catch (e2) {{
         throw e2;
     }}
@@ -104,29 +137,33 @@ doc.close(SaveOptions.DONOTSAVECHANGES);
             stderr=subprocess.PIPE,
             text=True,
         )
-
         if proc.returncode != 0:
             raise RuntimeError(f"Photoshop failed: {proc.stderr.strip() or proc.stdout.strip()}")
+
+        deadline = time.time() + 25
+        while time.time() < deadline and not out_file.exists():
+            time.sleep(0.2)
+
         if not out_file.exists():
-            raise RuntimeError("Photoshop ran but did not produce an output PNG.")
+            raise RuntimeError("Photoshop launched but no output PNG was created in time.")
 
         return Image.open(out_file).convert("RGBA")
 
 
 def _remove_background_rembg(rgb_image: Image.Image) -> Image.Image:
-    if rembg_remove is None:
+    if REMBG_REMOVE is None:
         raise RuntimeError("rembg is not available. Install rembg + onnxruntime.")
     raw = np.array(rgb_image)
-    out = rembg_remove(raw)
+    out = REMBG_REMOVE(raw)
     return Image.fromarray(out).convert("RGBA")
 
 
-def remove_background(rgb_image: Image.Image, engine: str) -> tuple[Image.Image, list[str]]:
+def remove_background(rgb_image: Image.Image, config: ProcessConfig) -> tuple[Image.Image, list[str]]:
     warnings: list[str] = []
-    engine = (engine or "photoshop").lower().strip()
+    engine = (config.removal_engine or "photoshop").lower().strip()
 
     if engine == "photoshop":
-        rgba = _remove_background_photoshop(rgb_image)
+        rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe)
         return rgba, warnings
 
     if engine == "rembg":
@@ -135,7 +172,7 @@ def remove_background(rgb_image: Image.Image, engine: str) -> tuple[Image.Image,
 
     if engine == "auto":
         try:
-            rgba = _remove_background_photoshop(rgb_image)
+            rgba = _remove_background_photoshop(rgb_image, config.photoshop_exe)
             warnings.append("Used Photoshop background removal.")
             return rgba, warnings
         except Exception:
@@ -185,7 +222,6 @@ def crop_headshot(rgba_image: Image.Image, config: ProcessConfig) -> tuple[Image
         subj_h = ay2 - ay1 + 1
         cx = (ax1 + ax2) / 2.0
 
-        # place chin a bit below center for the requested style
         if face is not None:
             fx, fy, fw, fh = face
             cy = fy + fh * 0.53
@@ -251,7 +287,7 @@ def process_one(src_path: Path, input_root: Path, output_root: Path, config: Pro
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     optimized = optimize_input_image(src_path, config)
-    rgba, bg_warnings = remove_background(optimized, config.removal_engine)
+    rgba, bg_warnings = remove_background(optimized, config)
     headshot, crop_warnings = crop_headshot(rgba, config)
     headshot.save(out_path, format="PNG", optimize=True)
 
@@ -270,10 +306,10 @@ def compose_preview(headshot_path: str, bg: tuple[int, int, int]) -> np.ndarray:
     return np.array(canvas.convert("RGB"))
 
 
-def open_in_photoshop(source_path: str, output_path: str) -> str:
-    photoshop_exe = os.environ.get("PHOTOSHOP_EXE")
+def open_in_photoshop(source_path: str, output_path: str, photoshop_exe_input: str) -> str:
+    photoshop_exe = (photoshop_exe_input or "").strip() or discover_photoshop_exe()
     if not photoshop_exe:
-        return "Set PHOTOSHOP_EXE to enable Photoshop launch."
+        return "Photoshop EXE not found. Set it in the UI field (or PHOTOSHOP_EXE env var)."
 
     if not source_path or not output_path:
         return "No selected output/source mapping yet. Select an output first."
@@ -291,28 +327,75 @@ def run_batch(
     workers: int,
     max_side: int,
     removal_engine: str,
-) -> tuple[str, list[str], str, list[str]]:
+    photoshop_exe_input: str,
+) -> tuple[str, list[str], str, gr.update, str, np.ndarray, np.ndarray, np.ndarray, str]:
     input_root = Path(input_folder)
     output_root = Path(output_folder)
 
+    blank = np.full((250, 250, 3), 35, dtype=np.uint8)
+
     if not input_root.exists():
-        return "Input folder does not exist.", [], "[]", []
+        return (
+            "Input folder does not exist.",
+            [],
+            "[]",
+            gr.update(choices=[], value=None),
+            "",
+            blank,
+            blank,
+            blank,
+            "",
+        )
 
     images = list(iter_images(input_root))
     if not images:
-        return "No supported images found.", [], "[]", []
+        return (
+            "No supported images found.",
+            [],
+            "[]",
+            gr.update(choices=[], value=None),
+            "",
+            blank,
+            blank,
+            blank,
+            "",
+        )
 
     output_root.mkdir(parents=True, exist_ok=True)
 
+    photoshop_exe = (photoshop_exe_input or "").strip() or discover_photoshop_exe()
     config = ProcessConfig(
         workers=max(1, int(workers)),
         max_side_for_processing=int(max_side),
         removal_engine=(removal_engine or "photoshop").lower(),
+        photoshop_exe=photoshop_exe,
     )
 
-    # Photoshop is effectively single-process; parallel workers can cause contention.
     if config.removal_engine == "photoshop":
         config.workers = 1
+        if not config.photoshop_exe:
+            msg = {
+                "total": len(images),
+                "processed": 0,
+                "failed": len(images),
+                "removal_engine": config.removal_engine,
+                "workers_used": config.workers,
+                "failures": [
+                    "Photoshop executable not configured. Fill 'Photoshop Executable Path' in UI or set PHOTOSHOP_EXE."
+                ],
+                "issues": [],
+            }
+            return (
+                json.dumps(msg, indent=2),
+                [],
+                "[]",
+                gr.update(choices=[], value=None),
+                "",
+                blank,
+                blank,
+                blank,
+                "",
+            )
 
     results: list[dict] = []
     failures: list[str] = []
@@ -334,22 +417,49 @@ def run_batch(
         "failed": len(failures),
         "removal_engine": config.removal_engine,
         "workers_used": config.workers,
+        "photoshop_exe": config.photoshop_exe or "",
         "failures": failures,
         "issues": [asdict(HeadshotIssue(r["relative"], r["warnings"])) for r in results if r["warnings"]],
     }
 
     preview_paths = [r["output"] for r in results]
     report_text = json.dumps(report, indent=2)
-    return report_text, preview_paths, json.dumps(results), preview_paths
+
+    if not preview_paths:
+        return (
+            report_text,
+            [],
+            json.dumps(results),
+            gr.update(choices=[], value=None),
+            "",
+            blank,
+            blank,
+            blank,
+            "",
+        )
+
+    first = preview_paths[0]
+    src = find_source_from_results(first, json.dumps(results))
+    w, g, b = show_preview(first)
+    return (
+        report_text,
+        preview_paths,
+        json.dumps(results),
+        gr.update(choices=preview_paths, value=first),
+        first,
+        w,
+        g,
+        b,
+        src,
+    )
 
 
 def show_preview(image_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    blank = np.full((250, 250, 3), 35, dtype=np.uint8)
     if not image_path:
-        blank = np.full((250, 250, 3), 35, dtype=np.uint8)
         return blank, blank, blank
 
     if not Path(image_path).exists():
-        blank = np.full((250, 250, 3), 35, dtype=np.uint8)
         return blank, blank, blank
 
     return (
@@ -397,6 +507,8 @@ def build_ui() -> gr.Blocks:
     #hero-preview img {min-height: 460px; object-fit: contain; background: #000;}
     """
 
+    default_photoshop = discover_photoshop_exe()
+
     with gr.Blocks(theme=theme, css=css, title="Pro Headshot Cutout Studio") as demo:
         gr.Markdown("## Pro Headshot Cutout Studio")
         gr.Markdown(
@@ -407,6 +519,11 @@ def build_ui() -> gr.Blocks:
             with gr.Column(scale=1, elem_classes=["panel"]):
                 input_folder = gr.Textbox(label="Input Folder", placeholder="C:/path/to/source/root")
                 output_folder = gr.Textbox(label="Output Folder", placeholder="C:/path/to/output/root")
+                photoshop_exe_input = gr.Textbox(
+                    label="Photoshop Executable Path",
+                    value=default_photoshop,
+                    placeholder="C:/Program Files/Adobe/Adobe Photoshop 2024/Photoshop.exe",
+                )
                 removal_engine = gr.Radio(
                     choices=["photoshop", "auto", "rembg"],
                     value="photoshop",
@@ -436,15 +553,15 @@ def build_ui() -> gr.Blocks:
 
         run_btn.click(
             fn=run_batch,
-            inputs=[input_folder, output_folder, workers, max_side, removal_engine],
-            outputs=[report, gallery, state_results, picker],
+            inputs=[input_folder, output_folder, workers, max_side, removal_engine, photoshop_exe_input],
+            outputs=[report, gallery, state_results, picker, selected, preview_white, preview_grey, preview_black, source_for_open],
         )
 
         gallery.select(fn=extract_gallery_path, outputs=selected)
         picker.change(fn=lambda v: v or "", inputs=picker, outputs=selected)
         selected.change(fn=show_preview, inputs=selected, outputs=[preview_white, preview_grey, preview_black])
         selected.change(fn=find_source_from_results, inputs=[selected, state_results], outputs=source_for_open)
-        open_ps.click(fn=open_in_photoshop, inputs=[source_for_open, selected], outputs=open_status)
+        open_ps.click(fn=open_in_photoshop, inputs=[source_for_open, selected, photoshop_exe_input], outputs=open_status)
 
     return demo
 

@@ -26,7 +26,10 @@ Open: `http://localhost:7860`
 
 ## Photoshop setup (Windows)
 
-Set `PHOTOSHOP_EXE` to Photoshop executable path.
+You can configure Photoshop in either way:
+
+1. Put the path in the UI field **Photoshop Executable Path** (recommended).
+2. Or set env var `PHOTOSHOP_EXE`.
 
 Example PowerShell:
 
@@ -44,7 +47,8 @@ In the UI, set **Background Removal Engine** to:
 ## Notes
 
 - For `photoshop` mode, worker count is forced to 1 because Photoshop automation is single-instance and parallel jobs can conflict.
-- If preview panes are blank, pick an output from **Pick Output (stable preview)** dropdown (in addition to gallery click).
+- Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
+- If `photoshop` mode is selected without an exe path, the report returns a single clear configuration error instead of 1 failure per file.
 
 ## Supported input file types
 
