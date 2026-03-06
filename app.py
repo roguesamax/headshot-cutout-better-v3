@@ -418,51 +418,91 @@ def crop_headshot(
     face = preferred_face or detect_primary_face_bbox(rgba_image)
     a_bbox = alpha_bbox(rgba_image)
 
-    # Primary framing: face-first (for full-body sources this avoids body-centered crops).
+    def clamp_square(cx: float, cy: float, side: float) -> tuple[int, int, int, int, float]:
+        side = float(max(40, min(side, max(width, height))))
+        left = int(round(cx - side / 2))
+        top = int(round(cy - side / 2))
+        right = int(round(left + side))
+        bottom = int(round(top + side))
+
+        if left < 0:
+            right -= left
+            left = 0
+        if top < 0:
+            bottom -= top
+            top = 0
+        if right > width:
+            shift = right - width
+            left -= shift
+            right = width
+        if bottom > height:
+            shift = bottom - height
+            top -= shift
+            bottom = height
+
+        left = max(0, left)
+        top = max(0, top)
+        side = float(min(right - left, bottom - top))
+        right = int(left + side)
+        bottom = int(top + side)
+        return left, top, right, bottom, side
+
     if face is not None:
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
-        cy = fy + fh * 0.44  # add more hair headroom
-        side = max(fw * 1.74, fh * 1.92)
+
+        # Target composition: chin ~3-5 px above bottom in 250x250 output.
+        target_chin_px = config.output_size - 4
+        side = max(fw * 1.58, fh * 1.72)
+
+        jaw_y = fy + fh
+        hair_top_est = fy - fh * 0.34
+        left_ear_est = fx - fw * 0.22
+        right_ear_est = fx + fw * 1.22
+
+        chosen = None
+        for _ in range(14):
+            cy = jaw_y - ((target_chin_px / config.output_size) - 0.5) * side
+            left, top, right, bottom, side_used = clamp_square(cx, cy, side)
+
+            # Hard constraints to avoid clipping.
+            ok_hair = top <= hair_top_est + 1
+            ok_side_face = left <= left_ear_est + 1 and right >= right_ear_est - 1
+
+            ok_alpha = True
+            if a_bbox is not None:
+                ax1, ay1, ax2, ay2 = a_bbox
+                ok_alpha = top <= ay1 + 1 and left <= ax1 + 1 and right >= ax2 - 1
+
+            if ok_hair and ok_side_face and ok_alpha:
+                chosen = (left, top, right, bottom)
+                break
+
+            side *= 1.08
+
+        if chosen is None:
+            warnings.append("Adaptive framing hit bounds; used safest unclipped crop.")
+            cy = jaw_y - ((target_chin_px / config.output_size) - 0.5) * side
+            chosen = clamp_square(cx, cy, side)[:4]
+
+        left, top, right, bottom = chosen
+
     elif a_bbox is not None:
         warnings.append("Face detection failed; used alpha-mask fallback framing.")
         ax1, ay1, ax2, ay2 = a_bbox
         subj_w = ax2 - ax1 + 1
         subj_h = ay2 - ay1 + 1
         cx = (ax1 + ax2) / 2.0
-        cy = ay1 + subj_h * 0.36
-        side = max(subj_w * 1.05, subj_h * 0.72)
+        cy = ay1 + subj_h * 0.32
+        side = max(subj_w * 0.98, subj_h * 0.62)
+        left, top, right, bottom, _ = clamp_square(cx, cy, side)
     else:
         warnings.append("No subject/face reliably detected; used center square fallback.")
         side = min(width, height)
         left = (width - side) // 2
         top = (height - side) // 2
-        crop = rgba_image.crop((left, top, left + side, top + side))
-        return crop.resize((config.output_size, config.output_size), Image.Resampling.LANCZOS), warnings
-
-    side = int(max(40, min(side, max(width, height))))
-    left = int(round(cx - side / 2))
-    top = int(round(cy - side / 2))
-    right = left + side
-    bottom = top + side
-
-    if left < 0:
-        right -= left
-        left = 0
-    if top < 0:
-        bottom -= top
-        top = 0
-    if right > width:
-        shift = right - width
-        left -= shift
-        right = width
-    if bottom > height:
-        shift = bottom - height
-        top -= shift
-        bottom = height
-
-    left = max(0, left)
-    top = max(0, top)
+        right = left + side
+        bottom = top + side
 
     crop = rgba_image.crop((left, top, right, bottom)).resize((config.output_size, config.output_size), Image.Resampling.LANCZOS)
 
@@ -837,7 +877,6 @@ def build_ui() -> gr.Blocks:
         )
 
         gallery.select(fn=extract_gallery_path, outputs=selected)
-        gallery.select(fn=lambda evt: extract_gallery_path(evt), outputs=picker)
         picker.change(fn=lambda v: v or "", inputs=picker, outputs=selected)
         selected.change(fn=show_preview, inputs=selected, outputs=[preview_white, preview_grey, preview_black])
         selected.change(fn=find_paths_from_results, inputs=[selected, state_results], outputs=[source_for_open, actual_output_for_open])
