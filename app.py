@@ -7,6 +7,8 @@ import os
 import subprocess
 import tempfile
 import time
+import tkinter as tk
+from tkinter import filedialog
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -67,6 +69,20 @@ def optimize_input_image(src_path: Path, config: ProcessConfig) -> Image.Image:
 
 def _escape_jsx_path(path: str) -> str:
     return path.replace("\\", "\\\\")
+
+
+def browse_for_directory(current_value: str) -> str:
+    """Open native folder picker (desktop/local runs)."""
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        initial = current_value if current_value and Path(current_value).exists() else str(Path.home())
+        selected = filedialog.askdirectory(initialdir=initial)
+        root.destroy()
+        return selected or current_value or ""
+    except Exception:
+        return current_value or ""
 
 
 def discover_photoshop_exe() -> str:
@@ -131,23 +147,28 @@ doc.close(SaveOptions.DONOTSAVECHANGES);
 """
         jsx_file.write_text(jsx, encoding="utf-8")
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [photoshop_exe, "-r", str(jsx_file)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
-        if proc.returncode != 0:
-            raise RuntimeError(f"Photoshop failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
-        deadline = time.time() + 25
-        while time.time() < deadline and not out_file.exists():
-            time.sleep(0.2)
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            if out_file.exists():
+                return Image.open(out_file).convert("RGBA")
 
-        if not out_file.exists():
-            raise RuntimeError("Photoshop launched but no output PNG was created in time.")
+            if proc.poll() is not None and proc.returncode not in (0, None):
+                stdout, stderr = proc.communicate()
+                raise RuntimeError(f"Photoshop failed: {(stderr or stdout).strip()}")
 
-        return Image.open(out_file).convert("RGBA")
+            time.sleep(0.25)
+
+        raise RuntimeError(
+            "Timed out waiting for Photoshop output. Photoshop may be waiting on a modal dialog. "
+            "Disable startup dialogs in Photoshop preferences and retry."
+        )
 
 
 def _remove_background_rembg(rgb_image: Image.Image) -> Image.Image:
@@ -518,7 +539,11 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             with gr.Column(scale=1, elem_classes=["panel"]):
                 input_folder = gr.Textbox(label="Input Folder", placeholder="C:/path/to/source/root")
+                with gr.Row():
+                    browse_input_btn = gr.Button("Browse Input Folder")
                 output_folder = gr.Textbox(label="Output Folder", placeholder="C:/path/to/output/root")
+                with gr.Row():
+                    browse_output_btn = gr.Button("Browse Output Folder")
                 photoshop_exe_input = gr.Textbox(
                     label="Photoshop Executable Path",
                     value=default_photoshop,
@@ -550,6 +575,9 @@ def build_ui() -> gr.Blocks:
                     preview_white = gr.Image(label="White", interactive=False, height=460)
                     preview_grey = gr.Image(label="Grey", interactive=False, height=460)
                     preview_black = gr.Image(label="Black", interactive=False, height=460)
+
+        browse_input_btn.click(fn=browse_for_directory, inputs=input_folder, outputs=input_folder)
+        browse_output_btn.click(fn=browse_for_directory, inputs=output_folder, outputs=output_folder)
 
         run_btn.click(
             fn=run_batch,

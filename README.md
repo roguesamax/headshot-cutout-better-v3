@@ -47,7 +47,9 @@ In the UI, set **Background Removal Engine** to:
 ## Notes
 
 - For `photoshop` mode, worker count is forced to 1 because Photoshop automation is single-instance and parallel jobs can conflict.
+- If Photoshop appears stuck on one image, check for hidden modal dialogs in Photoshop and disable startup/compatibility prompts.
 - Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
+- Added **Browse Input Folder** / **Browse Output Folder** buttons to open native folder picker dialogs (no copy/paste path needed).
 - If `photoshop` mode is selected without an exe path, the report returns a single clear configuration error instead of 1 failure per file.
 
 ## Supported input file types
