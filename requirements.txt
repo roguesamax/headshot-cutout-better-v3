@@ -4,3 +4,4 @@ opencv-python>=4.10.0.84
 numpy>=1.26.0
 rembg>=2.0.57
 onnxruntime>=1.18.0
+pywin32>=306; platform_system=="Windows"

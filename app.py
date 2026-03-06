@@ -5,7 +5,6 @@ import importlib.util
 import json
 import os
 import subprocess
-import tempfile
 import time
 import uuid
 import tkinter as tk
@@ -32,6 +31,18 @@ def _resolve_rembg_remove():
 
 
 REMBG_REMOVE = _resolve_rembg_remove()
+
+
+
+def _resolve_win32com_client():
+    if os.name != "nt":
+        return None
+    if importlib.util.find_spec("win32com.client") is None:
+        return None
+    return importlib.import_module("win32com.client")
+
+
+WIN32COM_CLIENT = _resolve_win32com_client()
 
 
 @dataclass
@@ -110,18 +121,65 @@ def discover_photoshop_exe() -> str:
     return ""
 
 
-def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job_root: Path) -> Image.Image:
+def _run_jsx_via_com(jsx: str, photoshop_exe: str) -> None:
+    if WIN32COM_CLIENT is None:
+        raise RuntimeError("pywin32 is not installed; COM automation unavailable.")
+
+    # Try to connect to existing Photoshop instance.
+    app = None
+    try:
+        app = WIN32COM_CLIENT.GetActiveObject("Photoshop.Application")
+    except Exception:
+        if photoshop_exe and Path(photoshop_exe).exists():
+            subprocess.Popen([photoshop_exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2.5)
+        app = WIN32COM_CLIENT.Dispatch("Photoshop.Application")
+
+    app.DoJavaScript(jsx)
+
+
+def _remove_background_photoshop_cli(job_dir: Path, photoshop_exe: str, jsx_file: Path, out_file: Path) -> None:
     if not photoshop_exe:
+        raise RuntimeError("Photoshop executable is not configured for CLI fallback.")
+
+    proc = subprocess.Popen(
+        [photoshop_exe, "-r", str(jsx_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        if out_file.exists():
+            return
+
+        if proc.poll() is not None:
+            stdout, stderr = proc.communicate()
+            if out_file.exists():
+                return
+            details = (stderr or stdout).strip()
+            raise RuntimeError(f"Photoshop CLI failed: {details or 'No output file created.'}")
+
+        time.sleep(0.25)
+
+    raise RuntimeError("Timed out waiting for Photoshop output in CLI mode.")
+
+
+def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job_root: Path) -> Image.Image:
+    if not photoshop_exe and WIN32COM_CLIENT is None:
         raise RuntimeError(
-            "Photoshop executable is not configured. Set PHOTOSHOP_EXE or use the UI field."
+            "Photoshop is not configured. Set executable path and/or install pywin32 for COM automation."
         )
 
-    job_dir = job_root / f"job_{uuid.uuid4().hex}"
+    job_id = uuid.uuid4().hex
+    job_dir = job_root / f"job_{job_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    src_file = job_dir / "source.png"
-    out_file = job_dir / "result.png"
-    jsx_file = job_dir / "remove_bg.jsx"
+    src_file = job_dir / f"source_{job_id}.png"
+    out_file = job_dir / f"result_{job_id}.png"
+    status_file = job_dir / f"status_{job_id}.txt"
+    jsx_file = job_dir / f"remove_bg_{job_id}.jsx"
 
     rgb_image.save(src_file, format="PNG")
 
@@ -130,51 +188,55 @@ def _remove_background_photoshop(rgb_image: Image.Image, photoshop_exe: str, job
 app.displayDialogs = DialogModes.NO;
 var inFile = new File('{_escape_jsx_path(str(src_file))}');
 var outFile = new File('{_escape_jsx_path(str(out_file))}');
-app.open(inFile);
-var doc = app.activeDocument;
+var statusFile = new File('{_escape_jsx_path(str(status_file))}');
 
 try {{
-    app.runMenuItem(stringIDToTypeID('autoCutout'));
-}} catch (e) {{
-    try {{
-        app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
-    }} catch (e2) {{
-        throw e2;
-    }}
-}}
+    app.open(inFile);
+    var doc = app.activeDocument;
 
-var opts = new PNGSaveOptions();
-opts.compression = 6;
-doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
-doc.close(SaveOptions.DONOTSAVECHANGES);
+    try {{
+        app.runMenuItem(stringIDToTypeID('autoCutout'));
+    }} catch (e) {{
+        app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
+    }}
+
+    var opts = new PNGSaveOptions();
+    opts.compression = 6;
+    doc.saveAs(outFile, opts, true, Extension.LOWERCASE);
+    doc.close(SaveOptions.DONOTSAVECHANGES);
+
+    statusFile.open('w');
+    statusFile.write('OK');
+    statusFile.close();
+}} catch (err) {{
+    try {{
+        statusFile.open('w');
+        statusFile.write('ERROR: ' + err.toString());
+        statusFile.close();
+    }} catch (_) {{}}
+    throw err;
+}}
 """
     jsx_file.write_text(jsx, encoding="utf-8")
 
-    proc = subprocess.Popen(
-        [photoshop_exe, "-r", str(jsx_file)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    com_error: Exception | None = None
+    if WIN32COM_CLIENT is not None:
+        try:
+            _run_jsx_via_com(jsx, photoshop_exe)
+        except Exception as exc:
+            com_error = exc
 
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        if out_file.exists():
-            # Copy into memory immediately; keep source files on disk to avoid lock/delete races.
-            return Image.open(out_file).convert("RGBA")
+    if not out_file.exists():
+        _remove_background_photoshop_cli(job_dir, photoshop_exe, jsx_file, out_file)
 
-        # Some Photoshop builds can return non-zero while still doing work; do not fail fast.
-        if proc.poll() is not None and proc.returncode == 0 and not out_file.exists():
-            # Small grace period after process exits.
-            time.sleep(0.6)
-            if out_file.exists():
-                return Image.open(out_file).convert("RGBA")
+    if not out_file.exists():
+        if status_file.exists():
+            raise RuntimeError(status_file.read_text(encoding="utf-8", errors="ignore").strip())
+        if com_error:
+            raise RuntimeError(f"Photoshop COM failed and CLI produced no file: {com_error}")
+        raise RuntimeError("Photoshop did not create output PNG.")
 
-        time.sleep(0.25)
-
-    raise RuntimeError(
-        "Timed out waiting for Photoshop output. Photoshop may be blocked by modal dialogs or plugin prompts."
-    )
+    return Image.open(out_file).convert("RGBA")
 
 
 def _remove_background_rembg(rgb_image: Image.Image) -> Image.Image:

@@ -49,6 +49,7 @@ In the UI, set **Background Removal Engine** to:
 - For `photoshop` mode, worker count is forced to 1 because Photoshop automation is single-instance and parallel jobs can conflict.
 - If Photoshop appears stuck on one image, check for hidden modal dialogs in Photoshop and disable startup/compatibility prompts.
 - Photoshop processing now stages per-image files under `output/.ps_jobs` to avoid temp-file lock/deletion races on Windows.
+- Photoshop automation now prefers Windows COM (`pywin32`) for stable per-image scripting, with CLI fallback if COM is unavailable.
 - Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
 - Added **Browse Input Folder** / **Browse Output Folder** buttons to open native folder picker dialogs (no copy/paste path needed).
 - If `photoshop` mode is selected without an exe path, the report returns a single clear configuration error instead of 1 failure per file.
