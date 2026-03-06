@@ -46,6 +46,16 @@ def _resolve_win32com_client():
 WIN32COM_CLIENT = _resolve_win32com_client()
 
 
+def _resolve_dlib_module():
+    if importlib.util.find_spec("dlib") is None:
+        return None
+    return importlib.import_module("dlib")
+
+
+DLIB = _resolve_dlib_module()
+DLIB_HOG_DETECTOR = DLIB.get_frontal_face_detector() if DLIB is not None else None
+
+
 @dataclass
 class ProcessConfig:
     max_side_for_processing: int = 2200
@@ -366,6 +376,22 @@ def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[I
 def detect_primary_face_bbox(image: Image.Image) -> tuple[int, int, int, int] | None:
     rgb = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # 1) dlib HOG (if available) is generally more stable for portrait framing.
+    if DLIB_HOG_DETECTOR is not None:
+        try:
+            rects = DLIB_HOG_DETECTOR(gray, 1)
+            if rects:
+                rect = sorted(rects, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()), reverse=True)[0]
+                x = max(0, int(rect.left()))
+                y = max(0, int(rect.top()))
+                w = max(1, int(rect.right() - rect.left()))
+                h = max(1, int(rect.bottom() - rect.top()))
+                return x, y, w, h
+        except Exception:
+            pass
+
+    # 2) OpenCV Haar fallback.
     faces = CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
     if len(faces) == 0:
         return None
@@ -396,14 +422,8 @@ def crop_headshot(
     if face is not None:
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
-        cy = fy + fh * 0.54  # slight under-chin only
-        side = max(fw * 1.95, fh * 2.10)
-
-        # keep crop somewhat aligned with extracted alpha when available
-        if a_bbox is not None:
-            ax1, ay1, ax2, ay2 = a_bbox
-            subj_w = ax2 - ax1 + 1
-            side = max(side, subj_w * 0.70)
+        cy = fy + fh * 0.49  # tighter chin framing
+        side = max(fw * 1.62, fh * 1.78)
     elif a_bbox is not None:
         warnings.append("Face detection failed; used alpha-mask fallback framing.")
         ax1, ay1, ax2, ay2 = a_bbox
@@ -595,6 +615,7 @@ def run_batch(
                 blank,
                 blank,
                 "",
+                "",
             )
 
     results: list[dict] = []
@@ -733,8 +754,11 @@ def extract_gallery_path(evt: gr.SelectData) -> str:
     if isinstance(value, (list, tuple)) and len(value) > 0:
         return str(value[0])
     if isinstance(value, dict):
-        if "image" in value and isinstance(value["image"], (list, tuple)) and value["image"]:
-            return str(value["image"][0])
+        image_value = value.get("image")
+        if isinstance(image_value, str):
+            return image_value
+        if isinstance(image_value, (list, tuple)) and image_value:
+            return str(image_value[0])
         if "name" in value:
             return str(value["name"])
     return ""
