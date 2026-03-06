@@ -54,6 +54,7 @@ class ProcessConfig:
     photoshop_exe: str = ""
     job_root: str = ""
     prep_root: str = ""
+    photoshop_automation_mode: str = "com_only"
 
 
 @dataclass
@@ -179,11 +180,13 @@ def _remove_background_photoshop_cli(job_dir: Path, photoshop_exe: str, jsx_file
     raise RuntimeError("Timed out waiting for Photoshop output in CLI mode.")
 
 
-def _remove_background_photoshop(staged_input_path: Path, photoshop_exe: str, job_root: Path) -> Image.Image:
-    if not photoshop_exe and WIN32COM_CLIENT is None:
+def _remove_background_photoshop(staged_input_path: Path, photoshop_exe: str, job_root: Path, automation_mode: str) -> Image.Image:
+    if WIN32COM_CLIENT is None and automation_mode in ("com_only", "com_then_cli"):
         raise RuntimeError(
-            "Photoshop is not configured. Set executable path and/or install pywin32 for COM automation."
+            "pywin32 is required for Photoshop automation on your setup. Install pywin32 and restart the app."
         )
+    if not photoshop_exe and automation_mode in ("cli_only", "com_then_cli"):
+        raise RuntimeError("Photoshop executable is not configured.")
 
     job_id = uuid.uuid4().hex
     job_dir = job_root / f"job_{job_id}"
@@ -208,39 +211,41 @@ function unlockLayerIfNeeded(doc) {{
     }} catch (e) {{}}
 }}
 
-function runRemoveBackgroundMenu() {{
+function tryRunMenu(idName) {{
     try {{
-        app.runMenuItem(stringIDToTypeID('autoCutout'));
+        app.runMenuItem(stringIDToTypeID(idName));
         return true;
-    }} catch (e1) {{
-        try {{
-            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
-            return true;
-        }} catch (e2) {{
-            return false;
-        }}
+    }} catch (e) {{
+        return false;
     }}
 }}
 
-function selectSubjectAndMask() {{
-    // 1) Select Subject
-    var didSelect = false;
+function tryExecAction(idName) {{
     try {{
-        executeAction(stringIDToTypeID('selectSubject'), undefined, DialogModes.NO);
-        didSelect = true;
-    }} catch (s1) {{
-        try {{
-            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
-            didSelect = true;
-        }} catch (s2) {{
-            didSelect = false;
-        }}
+        executeAction(stringIDToTypeID(idName), undefined, DialogModes.NO);
+        return true;
+    }} catch (e) {{
+        return false;
     }}
-    if (!didSelect) {{
-        throw new Error('No compatible Select Subject / Remove Background action found in this Photoshop version.');
-    }}
+}}
 
-    // 2) Create reveal-selection mask on current layer
+function removeBackgroundCompat() {{
+    // Newer Photoshop builds may expose different command IDs.
+    if (tryExecAction('removeBackground')) return true;
+    if (tryRunMenu('removeBackground')) return true;
+    if (tryRunMenu('autoCutout')) return true;
+    if (tryRunMenu('autoCutoutSubject')) return true;
+    return false;
+}}
+
+function selectSubjectCompat() {{
+    if (tryExecAction('selectSubject')) return true;
+    if (tryRunMenu('selectSubject')) return true;
+    if (tryRunMenu('autoCutoutSubject')) return true;
+    return false;
+}}
+
+function applySelectionMask(doc) {{
     var idMk = charIDToTypeID('Mk  ');
     var desc = new ActionDescriptor();
     var idNw = charIDToTypeID('Nw  ');
@@ -258,10 +263,7 @@ function selectSubjectAndMask() {{
     desc.putEnumerated(idUsng, idUsrM, idRvlS);
 
     executeAction(idMk, desc, DialogModes.NO);
-
-    try {{
-        doc.selection.deselect();
-    }} catch (e) {{}}
+    try {{ doc.selection.deselect(); }} catch (e) {{}}
 }}
 
 try {{
@@ -269,9 +271,13 @@ try {{
     var doc = app.activeDocument;
     unlockLayerIfNeeded(doc);
 
-    var removed = runRemoveBackgroundMenu();
+    var removed = removeBackgroundCompat();
     if (!removed) {{
-        selectSubjectAndMask();
+        var selected = selectSubjectCompat();
+        if (!selected) {{
+            throw new Error('No compatible Remove Background/Select Subject action found in this Photoshop build.');
+        }}
+        applySelectionMask(doc);
     }}
 
     var opts = new PNGSaveOptions();
@@ -294,20 +300,29 @@ try {{
     jsx_file.write_text(jsx, encoding="utf-8")
 
     com_error: Exception | None = None
-    if WIN32COM_CLIENT is not None:
+    cli_error: Exception | None = None
+
+    if automation_mode in ("com_only", "com_then_cli"):
         try:
             _run_jsx_via_com(jsx, photoshop_exe)
         except Exception as exc:
             com_error = exc
 
-    if not out_file.exists():
-        _remove_background_photoshop_cli(job_dir, photoshop_exe, jsx_file, out_file)
+    if (not out_file.exists()) and automation_mode in ("cli_only", "com_then_cli"):
+        try:
+            _remove_background_photoshop_cli(job_dir, photoshop_exe, jsx_file, out_file)
+        except Exception as exc:
+            cli_error = exc
 
     if not out_file.exists():
         if status_file.exists():
             raise RuntimeError(status_file.read_text(encoding="utf-8", errors="ignore").strip())
+        if com_error and cli_error:
+            raise RuntimeError(f"Photoshop COM error: {com_error} | CLI error: {cli_error}")
         if com_error:
-            raise RuntimeError(f"Photoshop COM failed and CLI produced no file: {com_error}")
+            raise RuntimeError(f"Photoshop COM failed: {com_error}")
+        if cli_error:
+            raise RuntimeError(f"Photoshop CLI failed: {cli_error}")
         raise RuntimeError("Photoshop did not create output PNG.")
 
     return Image.open(out_file).convert("RGBA")
@@ -327,7 +342,7 @@ def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[I
     engine = (config.removal_engine or "photoshop").lower().strip()
 
     if engine == "photoshop":
-        rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root))
+        rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root), config.photoshop_automation_mode)
         return rgba, warnings
 
     if engine == "rembg":
@@ -336,7 +351,7 @@ def remove_background(staged_input_path: Path, config: ProcessConfig) -> tuple[I
 
     if engine == "auto":
         try:
-            rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root))
+            rgba = _remove_background_photoshop(staged_input_path, config.photoshop_exe, Path(config.job_root), config.photoshop_automation_mode)
             warnings.append("Used Photoshop background removal.")
             return rgba, warnings
         except Exception:
@@ -542,6 +557,7 @@ def run_batch(
         photoshop_exe=photoshop_exe,
         job_root=str(job_root),
         prep_root=str(prep_root),
+        photoshop_automation_mode="com_only",
     )
 
     if config.removal_engine == "photoshop":
@@ -608,6 +624,7 @@ def run_batch(
         "workers_used": 1 if config.removal_engine == "photoshop" else config.workers,
         "preprocessed": len(prepped_items),
         "photoshop_exe": config.photoshop_exe or "",
+        "photoshop_automation_mode": config.photoshop_automation_mode,
         "failures": failures,
         "issues": [asdict(HeadshotIssue(r["relative"], r["warnings"])) for r in results if r["warnings"]],
     }

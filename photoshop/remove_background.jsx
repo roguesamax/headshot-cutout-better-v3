@@ -1,8 +1,8 @@
 /*
   Version-tolerant Photoshop background removal helper.
   Strategy:
-  1) Try Remove Background menu IDs.
-  2) Fallback to Select Subject + reveal-selection mask.
+  1) Try Remove Background IDs (new/old variants)
+  2) Fallback to Select Subject IDs + reveal-selection mask
 */
 
 app.displayDialogs = DialogModes.NO;
@@ -15,38 +15,40 @@ function unlockLayerIfNeeded(doc) {
     } catch (e) {}
 }
 
-function runRemoveBackgroundMenu() {
+function tryRunMenu(idName) {
     try {
-        app.runMenuItem(stringIDToTypeID('autoCutout'));
+        app.runMenuItem(stringIDToTypeID(idName));
         return true;
-    } catch (e1) {
-        try {
-            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
-            return true;
-        } catch (e2) {
-            return false;
-        }
+    } catch (e) {
+        return false;
     }
 }
 
-function selectSubjectAndMask(doc) {
-    var didSelect = false;
+function tryExecAction(idName) {
     try {
-        executeAction(stringIDToTypeID('selectSubject'), undefined, DialogModes.NO);
-        didSelect = true;
-    } catch (s1) {
-        try {
-            app.runMenuItem(stringIDToTypeID('autoCutoutSubject'));
-            didSelect = true;
-        } catch (s2) {
-            didSelect = false;
-        }
+        executeAction(stringIDToTypeID(idName), undefined, DialogModes.NO);
+        return true;
+    } catch (e) {
+        return false;
     }
+}
 
-    if (!didSelect) {
-        throw new Error('No compatible Select Subject / Remove Background action found.');
-    }
+function removeBackgroundCompat() {
+    if (tryExecAction('removeBackground')) return true;
+    if (tryRunMenu('removeBackground')) return true;
+    if (tryRunMenu('autoCutout')) return true;
+    if (tryRunMenu('autoCutoutSubject')) return true;
+    return false;
+}
 
+function selectSubjectCompat() {
+    if (tryExecAction('selectSubject')) return true;
+    if (tryRunMenu('selectSubject')) return true;
+    if (tryRunMenu('autoCutoutSubject')) return true;
+    return false;
+}
+
+function applySelectionMask(doc) {
     var idMk = charIDToTypeID('Mk  ');
     var desc = new ActionDescriptor();
     var idNw = charIDToTypeID('Nw  ');
@@ -73,7 +75,13 @@ function selectSubjectAndMask(doc) {
 if (app.documents.length > 0) {
     var doc = app.activeDocument;
     unlockLayerIfNeeded(doc);
-    if (!runRemoveBackgroundMenu()) {
-        selectSubjectAndMask(doc);
+
+    var removed = removeBackgroundCompat();
+    if (!removed) {
+        var selected = selectSubjectCompat();
+        if (!selected) {
+            throw new Error('No compatible Remove Background/Select Subject action found in this Photoshop build.');
+        }
+        applySelectionMask(doc);
     }
 }
