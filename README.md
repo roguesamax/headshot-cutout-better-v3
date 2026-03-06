@@ -53,6 +53,7 @@ In the UI, set **Background Removal Engine** to:
 - Photoshop remove-background now uses an expanded compatibility fallback chain (`removeBackground`/`autoCutout` IDs → `Select Subject` IDs → `selection mask`) for versions where certain menu items are unavailable.
 - Batch processing now pre-selects the first output and auto-renders white/grey/black previews.
 - Batch report now includes simple processing logs and progress is shown while preprocessing + Photoshop/crop stages run.
+- UI preview/gallery files are mirrored into a local `.ui_cache` under the app directory to avoid Gradio external-path cache errors.
 - Added **Browse Input Folder** / **Browse Output Folder** buttons to open native folder picker dialogs (no copy/paste path needed).
 - If `photoshop` mode is selected without an exe path, the report returns a single clear configuration error instead of 1 failure per file.
 

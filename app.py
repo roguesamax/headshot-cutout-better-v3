@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+import shutil
 import os
 import subprocess
 import time
@@ -395,8 +396,8 @@ def crop_headshot(
     if face is not None:
         fx, fy, fw, fh = face
         cx = fx + fw / 2.0
-        cy = fy + fh * 0.58  # keep slightly under-chin
-        side = max(fw * 2.45, fh * 2.65)
+        cy = fy + fh * 0.54  # slight under-chin only
+        side = max(fw * 1.95, fh * 2.10)
 
         # keep crop somewhat aligned with extracted alpha when available
         if a_bbox is not None:
@@ -516,7 +517,7 @@ def run_batch(
     removal_engine: str,
     photoshop_exe_input: str,
     progress=gr.Progress(),
-) -> tuple[str, list[tuple[str, str]], str, gr.update, str, np.ndarray, np.ndarray, np.ndarray, str]:
+) -> tuple[str, list[tuple[str, str]], str, gr.update, str, np.ndarray, np.ndarray, np.ndarray, str, str]:
     input_root = Path(input_folder)
     output_root = Path(output_folder)
 
@@ -533,6 +534,7 @@ def run_batch(
             blank,
             blank,
             "",
+            "",
         )
 
     images = list(iter_images(input_root))
@@ -546,6 +548,7 @@ def run_batch(
             blank,
             blank,
             blank,
+            "",
             "",
         )
 
@@ -649,7 +652,22 @@ def run_batch(
     }
 
     preview_paths = [r["output"] for r in results]
-    gallery_items = [(p, Path(p).name) for p in preview_paths]
+    ui_cache = Path.cwd() / ".ui_cache"
+    ui_cache.mkdir(parents=True, exist_ok=True)
+
+    gallery_items: list[tuple[str, str]] = []
+    for i, row in enumerate(results):
+        out = Path(row["output"])
+        ui_name = f"{i:05d}_{out.name}"
+        ui_path = ui_cache / ui_name
+        try:
+            shutil.copy2(out, ui_path)
+            row["ui_output"] = str(ui_path)
+            gallery_items.append((str(ui_path), out.name))
+        except Exception:
+            row["ui_output"] = row["output"]
+            gallery_items.append((row["output"], out.name))
+
     report_text = json.dumps(report, indent=2)
 
     if not preview_paths:
@@ -663,21 +681,23 @@ def run_batch(
             blank,
             blank,
             "",
+            "",
         )
 
-    first = preview_paths[0]
-    src = find_source_from_results(first, json.dumps(results))
+    first = results[0].get("ui_output", preview_paths[0])
+    src, actual_out = find_paths_from_results(first, json.dumps(results))
     w, g, b = show_preview(first)
     return (
         report_text,
         gallery_items,
         json.dumps(results),
-        gr.update(choices=preview_paths, value=first),
+        gr.update(choices=[r.get("ui_output", r["output"]) for r in results], value=first),
         first,
         w,
         g,
         b,
         src,
+        actual_out,
     )
 
 
@@ -696,14 +716,14 @@ def show_preview(image_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
-def find_source_from_results(image_path: str, raw_results: str) -> str:
+def find_paths_from_results(image_path: str, raw_results: str) -> tuple[str, str]:
     if not image_path or not raw_results:
-        return ""
+        return "", ""
     rows = json.loads(raw_results)
     for row in rows:
-        if row["output"] == image_path:
-            return row["source"]
-    return ""
+        if row.get("ui_output") == image_path or row.get("output") == image_path:
+            return row.get("source", ""), row.get("output", "")
+    return "", ""
 
 
 def extract_gallery_path(evt: gr.SelectData) -> str:
@@ -736,7 +756,7 @@ def build_ui() -> gr.Blocks:
 
     default_photoshop = discover_photoshop_exe()
 
-    with gr.Blocks(theme=theme, css=css, title="Pro Headshot Cutout Studio") as demo:
+    with gr.Blocks(title="Pro Headshot Cutout Studio") as demo:
         gr.Markdown("## Pro Headshot Cutout Studio")
         gr.Markdown(
             "Photoshop-first batch headshot extraction (250x250 PNG), with structure-preserving output and QA checks."
@@ -772,6 +792,7 @@ def build_ui() -> gr.Blocks:
                 picker = gr.Dropdown(label="Pick Output (stable preview)", choices=[], interactive=True)
                 state_results = gr.State("[]")
                 source_for_open = gr.Textbox(label="Matched Source", interactive=False)
+                actual_output_for_open = gr.Textbox(label="Matched Output", interactive=False, visible=False)
 
                 with gr.Row():
                     open_ps = gr.Button("Open Source + Output in Photoshop")
@@ -788,18 +809,18 @@ def build_ui() -> gr.Blocks:
         run_btn.click(
             fn=run_batch,
             inputs=[input_folder, output_folder, workers, max_side, removal_engine, photoshop_exe_input],
-            outputs=[report, gallery, state_results, picker, selected, preview_white, preview_grey, preview_black, source_for_open],
+            outputs=[report, gallery, state_results, picker, selected, preview_white, preview_grey, preview_black, source_for_open, actual_output_for_open],
         )
 
         gallery.select(fn=extract_gallery_path, outputs=selected)
         picker.change(fn=lambda v: v or "", inputs=picker, outputs=selected)
         selected.change(fn=show_preview, inputs=selected, outputs=[preview_white, preview_grey, preview_black])
-        selected.change(fn=find_source_from_results, inputs=[selected, state_results], outputs=source_for_open)
-        open_ps.click(fn=open_in_photoshop, inputs=[source_for_open, selected, photoshop_exe_input], outputs=open_status)
+        selected.change(fn=find_paths_from_results, inputs=[selected, state_results], outputs=[source_for_open, actual_output_for_open])
+        open_ps.click(fn=open_in_photoshop, inputs=[source_for_open, actual_output_for_open, photoshop_exe_input], outputs=open_status)
 
     return demo
 
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    app.launch(server_name="0.0.0.0", server_port=7860, theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="slate", neutral_hue="slate", radius_size=gr.themes.sizes.radius_lg), css=""".gradio-container {background: #0f172a !important; color: #e2e8f0 !important;} .panel {background: #111827 !important; border: 1px solid #334155 !important; border-radius: 16px !important; padding: 12px;} #hero-preview img {min-height: 460px; object-fit: contain; background: #000;}""", allowed_paths=[str(Path.cwd())])
